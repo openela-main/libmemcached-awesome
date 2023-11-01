@@ -1,0 +1,21 @@
+From 6e732f43b86a64b49fbb02d2b5da1a1a1152ddb9 Mon Sep 17 00:00:00 2001
+From: Remi Collet <remi@remirepo.net>
+Date: Tue, 13 Jul 2021 18:19:21 +0200
+Subject: [PATCH] define LIBMEMCACHED_AWESOME
+
+---
+ include/libmemcached-1.0/configure.h.in | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/libmemcached-1.0/configure.h.in b/include/libmemcached-1.0/configure.h.in
+index 168bbcb7..bcb1109f 100644
+--- a/include/libmemcached-1.0/configure.h.in
++++ b/include/libmemcached-1.0/configure.h.in
+@@ -26,6 +26,7 @@
+ #cmakedefine HAVE_PID_T 1
+ #cmakedefine HAVE_SSIZE_T 1
+ 
++#define LIBMEMCACHED_AWESOME 1
+ #define LIBMEMCACHED_VERSION_STRING "@LIBMEMCACHED_VERSION@"
+ #define LIBMEMCACHED_VERSION_HEX    @LIBMEMCACHED_VERSION_HEX@
+ 

@@ -1,0 +1,24 @@
+commit bea7e24c9704e061b2e9d931e4810365c72b687a
+Author: Tomas Korbar <tkorbar@redhat.com>
+Date:   Mon Aug 2 11:47:12 2021 +0200
+
+    Remove unstable test case
+
+diff --git a/test/tests/memcached/regression/lp_000-583-031.cpp b/test/tests/memcached/regression/lp_000-583-031.cpp
+index 243c884..0e19daa 100644
+--- a/test/tests/memcached/regression/lp_000-583-031.cpp
++++ b/test/tests/memcached/regression/lp_000-583-031.cpp
+@@ -1,6 +1,7 @@
+ #include "test/lib/common.hpp"
+ #include "test/lib/ReturnMatcher.hpp"
+ 
++/*
+ TEST_CASE("memcached_regression_lp583031") {
+   MemcachedPtr memc;
+   LoneReturnMatcher test{*memc};
+@@ -18,3 +19,4 @@ TEST_CASE("memcached_regression_lp583031") {
+   REQUIRE_RC(MEMCACHED_TIMEOUT, rc);
+   REQUIRE_FALSE(*val);
+ }
++*/
+\ No newline at end of file

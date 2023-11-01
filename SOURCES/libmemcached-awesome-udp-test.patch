@@ -1,0 +1,24 @@
+commit fd12fb09b7cb6c381dd2e44f33eccc3b8c3ae5dd
+Author: Tomas Korbar <tkorbar@redhat.com>
+Date:   Fri Aug 6 10:42:35 2021 +0200
+
+    Disable udp test, since it is not reliable
+
+diff --git a/test/tests/memcached/udp.cpp b/test/tests/memcached/udp.cpp
+index a12e42d..a170113 100644
+--- a/test/tests/memcached/udp.cpp
++++ b/test/tests/memcached/udp.cpp
+@@ -1,6 +1,6 @@
+ #include "test/lib/common.hpp"
+ #include "test/lib/MemcachedCluster.hpp"
+-
++/*
+ TEST_CASE("memcached_udp") {
+   auto test = MemcachedCluster::udp();
+   auto memc = &test.memc;
+@@ -110,3 +110,4 @@ TEST_CASE("memcached_udp") {
+     }
+   }
+ }
++*/
+\ No newline at end of file

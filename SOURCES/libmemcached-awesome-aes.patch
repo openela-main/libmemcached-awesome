@@ -1,0 +1,1303 @@
+From 2aab18117a2b078dd0eb366f3766a1fef06da695 Mon Sep 17 00:00:00 2001
+From: Tomas Korbar <tkorbar@redhat.com>
+Date: Fri, 25 Jun 2021 11:55:46 +0200
+Subject: [PATCH 1/7] Add possibility to use libcrypto for encryption
+
+---
+ include/libhashkit-1.0/hashkit.h |   4 +-
+ src/libhashkit/CMakeLists.txt    |   9 +++
+ src/libhashkit/aes.cc            | 121 +++++++++++++++++++++++++++++--
+ src/libhashkit/aes.h             |  22 ++++++
+ src/libhashkit/encrypt.cc        |  42 +++++++++--
+ src/libhashkit/hashkit.cc        |  43 +++++++++--
+ src/libhashkit/rijndael.hpp      |   2 +-
+ src/libmemcached/is.h            |   2 +-
+ 8 files changed, 225 insertions(+), 20 deletions(-)
+
+diff --git a/include/libhashkit-1.0/hashkit.h b/include/libhashkit-1.0/hashkit.h
+index a05eb5f8..0f67e377 100644
+--- a/include/libhashkit-1.0/hashkit.h
++++ b/include/libhashkit-1.0/hashkit.h
+@@ -49,7 +49,7 @@ struct hashkit_st {
+     bool is_allocated : 1;
+   } options;
+ 
+-  void *_key;
++  void *_cryptographic_context;
+ };
+ 
+ #ifdef __cplusplus
+@@ -75,7 +75,7 @@ HASHKIT_API
+ hashkit_string_st *hashkit_decrypt(hashkit_st *, const char *source, size_t source_length);
+ 
+ HASHKIT_API
+-bool hashkit_key(hashkit_st *, const char *key, const size_t key_length);
++bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length);
+ 
+ #ifdef __cplusplus
+ } // extern "C"
+diff --git a/src/libhashkit/CMakeLists.txt b/src/libhashkit/CMakeLists.txt
+index 355afabb..d0e03d15 100644
+--- a/src/libhashkit/CMakeLists.txt
++++ b/src/libhashkit/CMakeLists.txt
+@@ -39,6 +39,15 @@ target_include_directories(libhashkit PUBLIC
+         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+         $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
+         $<INSTALL_INTERFACE:include>)
++
++find_package(OpenSSL)
++if(NOT OPENSSL_FOUND)
++  message(WARNING "crypto library not found")
++else()
++  add_compile_definitions(WITH_OPENSSL)
++  target_link_libraries(libhashkit PUBLIC OpenSSL::Crypto)
++endif()
++
+ configure_file(hashkitcon.h.in hashkitcon.h @ONLY)
+ 
+ install(TARGETS libhashkit EXPORT libhashkit-targets
+diff --git a/src/libhashkit/aes.cc b/src/libhashkit/aes.cc
+index 0b2f73d8..d4fdad5a 100644
+--- a/src/libhashkit/aes.cc
++++ b/src/libhashkit/aes.cc
+@@ -15,12 +15,122 @@
+ 
+ #include "libhashkit/common.h"
+ 
+-#include "libhashkit/rijndael.hpp"
+-
+ #include <cstring>
+ 
+-#define AES_KEY_LENGTH 256 /* 128, 192, 256 */
+-#define AES_BLOCK_SIZE 16
++#ifdef WITH_OPENSSL
++
++#include <openssl/evp.h>
++
++#define DIGEST_ROUNDS 5
++
++#define AES_KEY_NBYTES 32
++#define AES_IV_NBYTES  32
++
++bool aes_initialize(const unsigned char *key, const size_t key_length,
++                    encryption_context_t *crypto_context) {
++  unsigned char aes_key[AES_KEY_NBYTES];
++  unsigned char aes_iv[AES_IV_NBYTES];
++  if (aes_key == NULL || aes_iv == NULL) {
++    return false;
++  }
++
++  int i = EVP_BytesToKey(EVP_aes_256_cbc(), EVP_sha256(), NULL, key, key_length, DIGEST_ROUNDS,
++                         aes_key, aes_iv);
++  if (i != AES_KEY_NBYTES) {
++    return false;
++  }
++
++  EVP_CIPHER_CTX_init(crypto_context->encryption_context);
++  EVP_CIPHER_CTX_init(crypto_context->decryption_context);
++  if (EVP_EncryptInit_ex(crypto_context->encryption_context, EVP_aes_256_cbc(), NULL, key, aes_iv)
++          != 1
++      || EVP_DecryptInit_ex(crypto_context->decryption_context, EVP_aes_256_cbc(), NULL, key,
++                            aes_iv)
++          != 1)
++  {
++    return false;
++  }
++  return true;
++}
++
++hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsigned char *source,
++                               size_t source_length) {
++EVP_CIPHER_CTX *encryption_context = crypto_context->encryption_context;
++int cipher_length = source_length + EVP_CIPHER_CTX_block_size(encryption_context);
++int final_length = 0;
++unsigned char *cipher_text = (unsigned char *) malloc(cipher_length);
++if (cipher_text == NULL) {
++  return NULL;
++}
++if (EVP_EncryptInit_ex(encryption_context, NULL, NULL, NULL, NULL) != 1
++    || EVP_EncryptUpdate(encryption_context, cipher_text, &cipher_length, source, source_length)
++        != 1
++    || EVP_EncryptFinal_ex(encryption_context, cipher_text + cipher_length, &final_length) != 1)
++{
++  free(cipher_text);
++  return NULL;
++}
++
++hashkit_string_st *destination = hashkit_string_create(cipher_length + final_length);
++if (destination == NULL) {
++  return NULL;
++}
++char *dest = hashkit_string_c_str_mutable(destination);
++memcpy(dest, cipher_text, cipher_length + final_length);
++hashkit_string_set_length(destination, cipher_length + final_length);
++return destination;
++}
++
++hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsigned char *source,
++                               size_t source_length) {
++EVP_CIPHER_CTX *decryption_context = crypto_context->decryption_context;
++int plain_text_length = source_length;
++int final_length = 0;
++unsigned char *plain_text = (unsigned char *) malloc(plain_text_length);
++if (plain_text == NULL) {
++  return NULL;
++}
++if (EVP_DecryptInit_ex(decryption_context, NULL, NULL, NULL, NULL) != 1
++    || EVP_DecryptUpdate(decryption_context, plain_text, &plain_text_length, source, source_length)
++        != 1
++    || EVP_DecryptFinal_ex(decryption_context, plain_text + plain_text_length, &final_length) != 1)
++{
++  free(plain_text);
++  return NULL;
++}
++
++hashkit_string_st *destination = hashkit_string_create(plain_text_length + final_length);
++if (destination == NULL) {
++  return NULL;
++}
++char *dest = hashkit_string_c_str_mutable(destination);
++memcpy(dest, plain_text, plain_text_length + final_length);
++hashkit_string_set_length(destination, plain_text_length + final_length);
++return destination;
++}
++
++encryption_context_t *aes_clone_cryptographic_context(encryption_context_t *source) {
++  encryption_context_t *new_context = (encryption_context_t *) malloc(sizeof(encryption_context_t));
++  if (new_context == NULL)
++    return NULL;
++
++  new_context->encryption_context = EVP_CIPHER_CTX_new();
++  new_context->decryption_context = EVP_CIPHER_CTX_new();
++  if (new_context->encryption_context == NULL || new_context->decryption_context == NULL) {
++    free(new_context);
++    return NULL;
++  }
++  EVP_CIPHER_CTX_copy(new_context->encryption_context, source->encryption_context);
++  EVP_CIPHER_CTX_copy(new_context->decryption_context, source->decryption_context);
++  return new_context;
++}
++
++#else
++
++#  include "libhashkit/rijndael.hpp"
++
++#  define AES_KEY_LENGTH 256 /* 128, 192, 256 */
++#  define AES_BLOCK_SIZE 16
+ 
+ enum encrypt_t { AES_ENCRYPT, AES_DECRYPT };
+ 
+@@ -49,7 +159,7 @@ aes_key_t *aes_create_key(const char *key, const size_t key_length) {
+       if (ptr == rkey_end) {
+         ptr = rkey; /*  Just loop over tmp_key until we used all key */
+       }
+-      *ptr ^= (uint8_t)(*sptr);
++      *ptr ^= (uint8_t) (*sptr);
+     }
+ 
+     _aes_key->decode_key.nr = rijndaelKeySetupDec(_aes_key->decode_key.rk, rkey, AES_KEY_LENGTH);
+@@ -140,3 +250,4 @@ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t s
+ 
+   return destination;
+ }
++#endif
+\ No newline at end of file
+diff --git a/src/libhashkit/aes.h b/src/libhashkit/aes.h
+index 43a18b35..e021c5f1 100644
+--- a/src/libhashkit/aes.h
++++ b/src/libhashkit/aes.h
+@@ -15,6 +15,27 @@
+ 
+ #pragma once
+ 
++#ifdef WITH_OPENSSL
++
++#include <openssl/evp.h>
++
++typedef struct encryption_context {
++  EVP_CIPHER_CTX *encryption_context;
++  EVP_CIPHER_CTX *decryption_context;
++} encryption_context_t;
++
++hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsigned char *source,
++                               size_t source_length);
++
++hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsigned char *source,
++                               size_t source_length);
++
++bool aes_initialize(const unsigned char *key, const size_t key_length,
++                    encryption_context_t *crypto_context);
++
++encryption_context_t *aes_clone_cryptographic_context(encryption_context_t *source);
++#else
++
+ struct aes_key_t;
+ 
+ hashkit_string_st *aes_encrypt(aes_key_t *_aes_key, const char *source, size_t source_length);
+@@ -24,3 +45,4 @@ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t s
+ aes_key_t *aes_create_key(const char *key, const size_t key_length);
+ 
+ aes_key_t *aes_clone_key(aes_key_t *_aes_key);
++#endif
+\ No newline at end of file
+diff --git a/src/libhashkit/encrypt.cc b/src/libhashkit/encrypt.cc
+index 6446c018..dbc051ae 100644
+--- a/src/libhashkit/encrypt.cc
++++ b/src/libhashkit/encrypt.cc
+@@ -15,20 +15,50 @@
+ 
+ #include "libhashkit/common.h"
+ 
++#ifdef WITH_OPENSSL
++#  include <openssl/evp.h>
++#endif
++
+ hashkit_string_st *hashkit_encrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-  return aes_encrypt(static_cast<aes_key_t *>(kit->_key), source, source_length);
++#ifdef WITH_OPENSSL
++  return aes_encrypt((encryption_context_t *) kit->_cryptographic_context,
++                     (const unsigned char *) source, source_length);
++#else
++  return aes_encrypt((aes_key_t *) kit->_cryptographic_context, source,
++                     source_length);
++#endif
+ }
+ 
+ hashkit_string_st *hashkit_decrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-  return aes_decrypt(static_cast<aes_key_t *>(kit->_key), source, source_length);
++#ifdef WITH_OPENSSL
++  return aes_decrypt((encryption_context_t *) kit->_cryptographic_context,
++                     (const unsigned char *) source, source_length);
++#else
++  return aes_decrypt((aes_key_t *)kit->_cryptographic_context, source, source_length);
++#endif
+ }
+ 
++#ifdef WITH_OPENSSL
++bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
++  kit->_cryptographic_context = (encryption_context_t *) malloc(sizeof(encryption_context_t));
++  ((encryption_context_t *) kit->_cryptographic_context)->encryption_context = EVP_CIPHER_CTX_new();
++  ((encryption_context_t *) kit->_cryptographic_context)->decryption_context = EVP_CIPHER_CTX_new();
++  if (((encryption_context_t *) kit->_cryptographic_context)->encryption_context == NULL
++      || ((encryption_context_t *) kit->_cryptographic_context)->decryption_context == NULL)
++  {
++    return false;
++  }
++  return aes_initialize((const unsigned char *) key, key_length,
++                        (encryption_context_t *) kit->_cryptographic_context);
++}
++#else
+ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+-  if (kit->_key) {
+-    free(kit->_key);
++  if (kit->_cryptographic_context) {
++    free(kit->_cryptographic_context);
+   }
+ 
+-  kit->_key = aes_create_key(key, key_length);
++  kit->_cryptographic_context = aes_create_key(key, key_length);
+ 
+-  return bool(kit->_key);
++  return bool(kit->_cryptographic_context);
+ }
++#endif
+\ No newline at end of file
+diff --git a/src/libhashkit/hashkit.cc b/src/libhashkit/hashkit.cc
+index 6a179573..46cf6368 100644
+--- a/src/libhashkit/hashkit.cc
++++ b/src/libhashkit/hashkit.cc
+@@ -15,6 +15,10 @@
+ 
+ #include "libhashkit/common.h"
+ 
++#ifdef WITH_OPENSSL
++#  include <openssl/evp.h>
++#endif
++
+ static inline void _hashkit_init(hashkit_st *self) {
+   self->base_hash.function = hashkit_one_at_a_time;
+   self->base_hash.context = NULL;
+@@ -23,7 +27,7 @@ static inline void _hashkit_init(hashkit_st *self) {
+   self->distribution_hash.context = NULL;
+ 
+   self->flags.is_base_same_distributed = true;
+-  self->_key = NULL;
++  self->_cryptographic_context = NULL;
+ }
+ 
+ static inline hashkit_st *_hashkit_create(hashkit_st *self) {
+@@ -52,11 +56,26 @@ hashkit_st *hashkit_create(hashkit_st *self) {
+   return self;
+ }
+ 
++#ifdef WITH_OPENSSL
++static void cryptographic_context_free(encryption_context_t *context) {
++  EVP_CIPHER_CTX_free(context->encryption_context);
++  EVP_CIPHER_CTX_free(context->decryption_context);
++  free(context);
++}
++#endif
++
+ void hashkit_free(hashkit_st *self) {
+-  if (self and self->_key) {
+-    free(self->_key);
+-    self->_key = NULL;
++#ifdef WITH_OPENSSL
++  if (self and self->_cryptographic_context) {
++    cryptographic_context_free((encryption_context_t *)self->_cryptographic_context);
++    self->_cryptographic_context = NULL;
++  }
++#else
++  if (self and self->_cryptographic_context) {
++    free(self->_cryptographic_context);
++    self->_cryptographic_context = NULL;
+   }
++#endif
+ 
+   if (hashkit_is_allocated(self)) {
+     free(self);
+@@ -79,7 +98,21 @@ hashkit_st *hashkit_clone(hashkit_st *destination, const hashkit_st *source) {
+   destination->base_hash = source->base_hash;
+   destination->distribution_hash = source->distribution_hash;
+   destination->flags = source->flags;
+-  destination->_key = aes_clone_key(static_cast<aes_key_t *>(source->_key));
++#ifdef WITH_OPENSSL
++  if (destination->_cryptographic_context) {
++    cryptographic_context_free((encryption_context_t *)destination->_cryptographic_context);
++    destination->_cryptographic_context = NULL;
++  }
++  if (source->_cryptographic_context) {
++    destination->_cryptographic_context =
++        aes_clone_cryptographic_context(((encryption_context_t *) source->_cryptographic_context));
++    if (destination->_cryptographic_context) {
++      
++    }
++  }
++#else
++  destination->_cryptographic_context = aes_clone_key(static_cast<aes_key_t *>(source->_cryptographic_context));
++#endif
+ 
+   return destination;
+ }
+diff --git a/src/libhashkit/rijndael.hpp b/src/libhashkit/rijndael.hpp
+index 96f48e34..96961f8c 100644
+--- a/src/libhashkit/rijndael.hpp
++++ b/src/libhashkit/rijndael.hpp
+@@ -35,4 +35,4 @@ void rijndaelDecrypt(const u32 rk[/*4*(Nr + 1)*/], int Nr, const u8 ct[16], u8 p
+ #ifdef INTERMEDIATE_VALUE_KAT
+ void rijndaelEncryptRound(const u32 rk[/*4*(Nr + 1)*/], int Nr, u8 block[16], int rounds);
+ void rijndaelDecryptRound(const u32 rk[/*4*(Nr + 1)*/], int Nr, u8 block[16], int rounds);
+-#endif /* INTERMEDIATE_VALUE_KAT */
++#endif /* INTERMEDIATE_VALUE_KAT */
+\ No newline at end of file
+diff --git a/src/libmemcached/is.h b/src/libmemcached/is.h
+index d73b54e7..3987332f 100644
+--- a/src/libmemcached/is.h
++++ b/src/libmemcached/is.h
+@@ -17,7 +17,7 @@
+ 
+ /* These are private */
+ #define memcached_is_allocated(__object)        ((__object)->options.is_allocated)
+-#define memcached_is_encrypted(__object)        ((__object)->hashkit._key)
++#define memcached_is_encrypted(__object)        (!!(__object)->hashkit._cryptographic_context)
+ #define memcached_is_initialized(__object)      ((__object)->options.is_initialized)
+ #define memcached_is_purging(__object)          ((__object)->state.is_purging)
+ #define memcached_is_processing_input(__object) ((__object)->state.is_processing_input)
+-- 
+2.31.1
+
+From b7f446e55146456e368c3926347f4c771afcea8c Mon Sep 17 00:00:00 2001
+From: Michael Wallner <mike@php.net>
+Date: Mon, 12 Jul 2021 15:08:57 +0200
+Subject: [PATCH 2/7] libhashkit/aes: make using openssl configurable
+
+---
+ CMakeConfig.txt               |  3 +++
+ src/libhashkit/CMakeLists.txt | 16 ++++++++++------
+ src/libhashkit/aes.cc         |  4 ++--
+ src/libhashkit/aes.h          |  4 ++--
+ src/libhashkit/encrypt.cc     | 10 +++++-----
+ src/libhashkit/hashkit.cc     |  8 ++++----
+ 6 files changed, 26 insertions(+), 19 deletions(-)
+
+diff --git a/CMakeConfig.txt b/CMakeConfig.txt
+index 973ff824..d8afcaef 100644
+--- a/CMakeConfig.txt
++++ b/CMakeConfig.txt
+@@ -65,6 +65,9 @@ if(NOT DEFINED ENV{ENABLE_MEMASLAP})
+ endif()
+ option(ENABLE_MEMASLAP      "enable memaslap client"
+        $ENV{ENABLE_MEMASLAP})
++option(ENABLE_OPENSSL_CRYPTO
++                            "enable OpenSSL's libcrypto instead of bundled AES implementation"
++       $ENV{ENABLE_OPENSSL_CRYPTO})
+ 
+ if(BUILD_TESTING)
+     set(MEMCACHED_BINARY "$ENV{MEMCACHED_BINARY}"
+diff --git a/src/libhashkit/CMakeLists.txt b/src/libhashkit/CMakeLists.txt
+index d0e03d15..ed3f7f1d 100644
+--- a/src/libhashkit/CMakeLists.txt
++++ b/src/libhashkit/CMakeLists.txt
+@@ -40,12 +40,16 @@ target_include_directories(libhashkit PUBLIC
+         $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
+         $<INSTALL_INTERFACE:include>)
+ 
+-find_package(OpenSSL)
+-if(NOT OPENSSL_FOUND)
+-  message(WARNING "crypto library not found")
+-else()
+-  add_compile_definitions(WITH_OPENSSL)
+-  target_link_libraries(libhashkit PUBLIC OpenSSL::Crypto)
++if(ENABLE_OPENSSL_CRYPTO)
++        find_package(OpenSSL)
++        if(OPENSSL_FOUND)
++                if(OPENSSL_CRYPTO_LIBRARY)
++                        target_compile_definitions(libhashkit PRIVATE HAVE_OPENSSL_CRYPTO)
++                        target_link_libraries(libhashkit PUBLIC OpenSSL::Crypto)
++                else()
++                        message(WARNING "Could not find OpenSSL::Crypto")
++                endif()
++        endif()
+ endif()
+ 
+ configure_file(hashkitcon.h.in hashkitcon.h @ONLY)
+diff --git a/src/libhashkit/aes.cc b/src/libhashkit/aes.cc
+index d4fdad5a..d65a9d91 100644
+--- a/src/libhashkit/aes.cc
++++ b/src/libhashkit/aes.cc
+@@ -17,7 +17,7 @@
+ 
+ #include <cstring>
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ 
+ #include <openssl/evp.h>
+ 
+@@ -250,4 +250,4 @@ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t s
+ 
+   return destination;
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/libhashkit/aes.h b/src/libhashkit/aes.h
+index e021c5f1..243d501f 100644
+--- a/src/libhashkit/aes.h
++++ b/src/libhashkit/aes.h
+@@ -15,7 +15,7 @@
+ 
+ #pragma once
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ 
+ #include <openssl/evp.h>
+ 
+@@ -45,4 +45,4 @@ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t s
+ aes_key_t *aes_create_key(const char *key, const size_t key_length);
+ 
+ aes_key_t *aes_clone_key(aes_key_t *_aes_key);
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/libhashkit/encrypt.cc b/src/libhashkit/encrypt.cc
+index dbc051ae..e7898a6a 100644
+--- a/src/libhashkit/encrypt.cc
++++ b/src/libhashkit/encrypt.cc
+@@ -15,12 +15,12 @@
+ 
+ #include "libhashkit/common.h"
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ #  include <openssl/evp.h>
+ #endif
+ 
+ hashkit_string_st *hashkit_encrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+   return aes_encrypt((encryption_context_t *) kit->_cryptographic_context,
+                      (const unsigned char *) source, source_length);
+ #else
+@@ -30,7 +30,7 @@ hashkit_string_st *hashkit_encrypt(hashkit_st *kit, const char *source, size_t s
+ }
+ 
+ hashkit_string_st *hashkit_decrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+   return aes_decrypt((encryption_context_t *) kit->_cryptographic_context,
+                      (const unsigned char *) source, source_length);
+ #else
+@@ -38,7 +38,7 @@ hashkit_string_st *hashkit_decrypt(hashkit_st *kit, const char *source, size_t s
+ #endif
+ }
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+   kit->_cryptographic_context = (encryption_context_t *) malloc(sizeof(encryption_context_t));
+   ((encryption_context_t *) kit->_cryptographic_context)->encryption_context = EVP_CIPHER_CTX_new();
+@@ -61,4 +61,4 @@ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+ 
+   return bool(kit->_cryptographic_context);
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/libhashkit/hashkit.cc b/src/libhashkit/hashkit.cc
+index 46cf6368..d15d7372 100644
+--- a/src/libhashkit/hashkit.cc
++++ b/src/libhashkit/hashkit.cc
+@@ -15,7 +15,7 @@
+ 
+ #include "libhashkit/common.h"
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ #  include <openssl/evp.h>
+ #endif
+ 
+@@ -56,7 +56,7 @@ hashkit_st *hashkit_create(hashkit_st *self) {
+   return self;
+ }
+ 
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+ static void cryptographic_context_free(encryption_context_t *context) {
+   EVP_CIPHER_CTX_free(context->encryption_context);
+   EVP_CIPHER_CTX_free(context->decryption_context);
+@@ -65,7 +65,7 @@ static void cryptographic_context_free(encryption_context_t *context) {
+ #endif
+ 
+ void hashkit_free(hashkit_st *self) {
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+   if (self and self->_cryptographic_context) {
+     cryptographic_context_free((encryption_context_t *)self->_cryptographic_context);
+     self->_cryptographic_context = NULL;
+@@ -98,7 +98,7 @@ hashkit_st *hashkit_clone(hashkit_st *destination, const hashkit_st *source) {
+   destination->base_hash = source->base_hash;
+   destination->distribution_hash = source->distribution_hash;
+   destination->flags = source->flags;
+-#ifdef WITH_OPENSSL
++#ifdef HAVE_OPENSSL_CRYPTO
+   if (destination->_cryptographic_context) {
+     cryptographic_context_free((encryption_context_t *)destination->_cryptographic_context);
+     destination->_cryptographic_context = NULL;
+-- 
+2.31.1
+
+From 0d7a3e0e040ddf840d656b61f41419c252debcde Mon Sep 17 00:00:00 2001
+From: Michael Wallner <mike@php.net>
+Date: Mon, 12 Jul 2021 15:57:32 +0200
+Subject: [PATCH 3/7] libhashkit/aes: keep API compatible
+
+---
+ include/libhashkit-1.0/hashkit.h |  2 +-
+ src/libhashkit/encrypt.cc        | 28 ++++++++++++++--------------
+ src/libhashkit/hashkit.cc        | 30 +++++++++++++++---------------
+ src/libmemcached/is.h            |  2 +-
+ 4 files changed, 31 insertions(+), 31 deletions(-)
+
+diff --git a/include/libhashkit-1.0/hashkit.h b/include/libhashkit-1.0/hashkit.h
+index 0f67e377..09b7edeb 100644
+--- a/include/libhashkit-1.0/hashkit.h
++++ b/include/libhashkit-1.0/hashkit.h
+@@ -49,7 +49,7 @@ struct hashkit_st {
+     bool is_allocated : 1;
+   } options;
+ 
+-  void *_cryptographic_context;
++  void *_key;
+ };
+ 
+ #ifdef __cplusplus
+diff --git a/src/libhashkit/encrypt.cc b/src/libhashkit/encrypt.cc
+index e7898a6a..effa299f 100644
+--- a/src/libhashkit/encrypt.cc
++++ b/src/libhashkit/encrypt.cc
+@@ -21,44 +21,44 @@
+ 
+ hashkit_string_st *hashkit_encrypt(hashkit_st *kit, const char *source, size_t source_length) {
+ #ifdef HAVE_OPENSSL_CRYPTO
+-  return aes_encrypt((encryption_context_t *) kit->_cryptographic_context,
++  return aes_encrypt((encryption_context_t *) kit->_key,
+                      (const unsigned char *) source, source_length);
+ #else
+-  return aes_encrypt((aes_key_t *) kit->_cryptographic_context, source,
++  return aes_encrypt((aes_key_t *) kit->_key, source,
+                      source_length);
+ #endif
+ }
+ 
+ hashkit_string_st *hashkit_decrypt(hashkit_st *kit, const char *source, size_t source_length) {
+ #ifdef HAVE_OPENSSL_CRYPTO
+-  return aes_decrypt((encryption_context_t *) kit->_cryptographic_context,
++  return aes_decrypt((encryption_context_t *) kit->_key,
+                      (const unsigned char *) source, source_length);
+ #else
+-  return aes_decrypt((aes_key_t *)kit->_cryptographic_context, source, source_length);
++  return aes_decrypt((aes_key_t *)kit->_key, source, source_length);
+ #endif
+ }
+ 
+ #ifdef HAVE_OPENSSL_CRYPTO
+ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+-  kit->_cryptographic_context = (encryption_context_t *) malloc(sizeof(encryption_context_t));
+-  ((encryption_context_t *) kit->_cryptographic_context)->encryption_context = EVP_CIPHER_CTX_new();
+-  ((encryption_context_t *) kit->_cryptographic_context)->decryption_context = EVP_CIPHER_CTX_new();
+-  if (((encryption_context_t *) kit->_cryptographic_context)->encryption_context == NULL
+-      || ((encryption_context_t *) kit->_cryptographic_context)->decryption_context == NULL)
++  kit->_key = (encryption_context_t *) malloc(sizeof(encryption_context_t));
++  ((encryption_context_t *) kit->_key)->encryption_context = EVP_CIPHER_CTX_new();
++  ((encryption_context_t *) kit->_key)->decryption_context = EVP_CIPHER_CTX_new();
++  if (((encryption_context_t *) kit->_key)->encryption_context == NULL
++      || ((encryption_context_t *) kit->_key)->decryption_context == NULL)
+   {
+     return false;
+   }
+   return aes_initialize((const unsigned char *) key, key_length,
+-                        (encryption_context_t *) kit->_cryptographic_context);
++                        (encryption_context_t *) kit->_key);
+ }
+ #else
+ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+-  if (kit->_cryptographic_context) {
+-    free(kit->_cryptographic_context);
++  if (kit->_key) {
++    free(kit->_key);
+   }
+ 
+-  kit->_cryptographic_context = aes_create_key(key, key_length);
++  kit->_key = aes_create_key(key, key_length);
+ 
+-  return bool(kit->_cryptographic_context);
++  return bool(kit->_key);
+ }
+ #endif
+diff --git a/src/libhashkit/hashkit.cc b/src/libhashkit/hashkit.cc
+index d15d7372..e61b014d 100644
+--- a/src/libhashkit/hashkit.cc
++++ b/src/libhashkit/hashkit.cc
+@@ -27,7 +27,7 @@ static inline void _hashkit_init(hashkit_st *self) {
+   self->distribution_hash.context = NULL;
+ 
+   self->flags.is_base_same_distributed = true;
+-  self->_cryptographic_context = NULL;
++  self->_key = NULL;
+ }
+ 
+ static inline hashkit_st *_hashkit_create(hashkit_st *self) {
+@@ -66,14 +66,14 @@ static void cryptographic_context_free(encryption_context_t *context) {
+ 
+ void hashkit_free(hashkit_st *self) {
+ #ifdef HAVE_OPENSSL_CRYPTO
+-  if (self and self->_cryptographic_context) {
+-    cryptographic_context_free((encryption_context_t *)self->_cryptographic_context);
+-    self->_cryptographic_context = NULL;
++  if (self and self->_key) {
++    cryptographic_context_free((encryption_context_t *)self->_key);
++    self->_key = NULL;
+   }
+ #else
+-  if (self and self->_cryptographic_context) {
+-    free(self->_cryptographic_context);
+-    self->_cryptographic_context = NULL;
++  if (self and self->_key) {
++    free(self->_key);
++    self->_key = NULL;
+   }
+ #endif
+ 
+@@ -99,19 +99,19 @@ hashkit_st *hashkit_clone(hashkit_st *destination, const hashkit_st *source) {
+   destination->distribution_hash = source->distribution_hash;
+   destination->flags = source->flags;
+ #ifdef HAVE_OPENSSL_CRYPTO
+-  if (destination->_cryptographic_context) {
+-    cryptographic_context_free((encryption_context_t *)destination->_cryptographic_context);
+-    destination->_cryptographic_context = NULL;
++  if (destination->_key) {
++    cryptographic_context_free((encryption_context_t *)destination->_key);
++    destination->_key = NULL;
+   }
+-  if (source->_cryptographic_context) {
+-    destination->_cryptographic_context =
+-        aes_clone_cryptographic_context(((encryption_context_t *) source->_cryptographic_context));
+-    if (destination->_cryptographic_context) {
++  if (source->_key) {
++    destination->_key =
++        aes_clone_cryptographic_context(((encryption_context_t *) source->_key));
++    if (destination->_key) {
+       
+     }
+   }
+ #else
+-  destination->_cryptographic_context = aes_clone_key(static_cast<aes_key_t *>(source->_cryptographic_context));
++  destination->_key = aes_clone_key(static_cast<aes_key_t *>(source->_key));
+ #endif
+ 
+   return destination;
+diff --git a/src/libmemcached/is.h b/src/libmemcached/is.h
+index 3987332f..229fd9b0 100644
+--- a/src/libmemcached/is.h
++++ b/src/libmemcached/is.h
+@@ -17,7 +17,7 @@
+ 
+ /* These are private */
+ #define memcached_is_allocated(__object)        ((__object)->options.is_allocated)
+-#define memcached_is_encrypted(__object)        (!!(__object)->hashkit._cryptographic_context)
++#define memcached_is_encrypted(__object)        (!!(__object)->hashkit._key)
+ #define memcached_is_initialized(__object)      ((__object)->options.is_initialized)
+ #define memcached_is_purging(__object)          ((__object)->state.is_purging)
+ #define memcached_is_processing_input(__object) ((__object)->state.is_processing_input)
+-- 
+2.31.1
+
+From 6f1f694418c7effef13972ea135ce1c735042a8f Mon Sep 17 00:00:00 2001
+From: Michael Wallner <mike@php.net>
+Date: Mon, 12 Jul 2021 15:11:32 +0200
+Subject: [PATCH 4/7] libhashkit/aes: fix logic error in aes_initialize
+
+---
+ src/libhashkit/aes.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/libhashkit/aes.cc b/src/libhashkit/aes.cc
+index d65a9d91..e4ae96f8 100644
+--- a/src/libhashkit/aes.cc
++++ b/src/libhashkit/aes.cc
+@@ -30,7 +30,7 @@ bool aes_initialize(const unsigned char *key, const size_t key_length,
+                     encryption_context_t *crypto_context) {
+   unsigned char aes_key[AES_KEY_NBYTES];
+   unsigned char aes_iv[AES_IV_NBYTES];
+-  if (aes_key == NULL || aes_iv == NULL) {
++  if (!key) {
+     return false;
+   }
+ 
+-- 
+2.31.1
+
+From c8300fc7f692c617f1a583a9cb22732a840e7d3e Mon Sep 17 00:00:00 2001
+From: Michael Wallner <mike@php.net>
+Date: Mon, 12 Jul 2021 15:13:53 +0200
+Subject: [PATCH 5/7] libhashkit/aes: fix code indentation
+
+---
+ src/libhashkit/aes.cc | 94 ++++++++++++++++++++++---------------------
+ 1 file changed, 48 insertions(+), 46 deletions(-)
+
+diff --git a/src/libhashkit/aes.cc b/src/libhashkit/aes.cc
+index e4ae96f8..156bcd3d 100644
+--- a/src/libhashkit/aes.cc
++++ b/src/libhashkit/aes.cc
+@@ -55,58 +55,60 @@ bool aes_initialize(const unsigned char *key, const size_t key_length,
+ 
+ hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsigned char *source,
+                                size_t source_length) {
+-EVP_CIPHER_CTX *encryption_context = crypto_context->encryption_context;
+-int cipher_length = source_length + EVP_CIPHER_CTX_block_size(encryption_context);
+-int final_length = 0;
+-unsigned char *cipher_text = (unsigned char *) malloc(cipher_length);
+-if (cipher_text == NULL) {
+-  return NULL;
+-}
+-if (EVP_EncryptInit_ex(encryption_context, NULL, NULL, NULL, NULL) != 1
+-    || EVP_EncryptUpdate(encryption_context, cipher_text, &cipher_length, source, source_length)
+-        != 1
+-    || EVP_EncryptFinal_ex(encryption_context, cipher_text + cipher_length, &final_length) != 1)
+-{
+-  free(cipher_text);
+-  return NULL;
+-}
++  EVP_CIPHER_CTX *encryption_context = crypto_context->encryption_context;
++  int cipher_length = source_length + EVP_CIPHER_CTX_block_size(encryption_context);
++  int final_length = 0;
++  unsigned char *cipher_text = (unsigned char *) malloc(cipher_length);
++  if (cipher_text == NULL) {
++    return NULL;
++  }
++  if (EVP_EncryptInit_ex(encryption_context, NULL, NULL, NULL, NULL) != 1
++      || EVP_EncryptUpdate(encryption_context, cipher_text, &cipher_length, source, source_length)
++          != 1
++      || EVP_EncryptFinal_ex(encryption_context, cipher_text + cipher_length, &final_length) != 1)
++  {
++    free(cipher_text);
++    return NULL;
++  }
+ 
+-hashkit_string_st *destination = hashkit_string_create(cipher_length + final_length);
+-if (destination == NULL) {
+-  return NULL;
+-}
+-char *dest = hashkit_string_c_str_mutable(destination);
+-memcpy(dest, cipher_text, cipher_length + final_length);
+-hashkit_string_set_length(destination, cipher_length + final_length);
+-return destination;
++  hashkit_string_st *destination = hashkit_string_create(cipher_length + final_length);
++  if (destination == NULL) {
++    return NULL;
++  }
++  char *dest = hashkit_string_c_str_mutable(destination);
++  memcpy(dest, cipher_text, cipher_length + final_length);
++  hashkit_string_set_length(destination, cipher_length + final_length);
++  return destination;
+ }
+ 
+ hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsigned char *source,
+                                size_t source_length) {
+-EVP_CIPHER_CTX *decryption_context = crypto_context->decryption_context;
+-int plain_text_length = source_length;
+-int final_length = 0;
+-unsigned char *plain_text = (unsigned char *) malloc(plain_text_length);
+-if (plain_text == NULL) {
+-  return NULL;
+-}
+-if (EVP_DecryptInit_ex(decryption_context, NULL, NULL, NULL, NULL) != 1
+-    || EVP_DecryptUpdate(decryption_context, plain_text, &plain_text_length, source, source_length)
+-        != 1
+-    || EVP_DecryptFinal_ex(decryption_context, plain_text + plain_text_length, &final_length) != 1)
+-{
+-  free(plain_text);
+-  return NULL;
+-}
++  EVP_CIPHER_CTX *decryption_context = crypto_context->decryption_context;
++  int plain_text_length = source_length;
++  int final_length = 0;
++  unsigned char *plain_text = (unsigned char *) malloc(plain_text_length);
++  if (plain_text == NULL) {
++    return NULL;
++  }
++  if (EVP_DecryptInit_ex(decryption_context, NULL, NULL, NULL, NULL) != 1
++      || EVP_DecryptUpdate(decryption_context, plain_text, &plain_text_length, source,
++                           source_length)
++          != 1
++      || EVP_DecryptFinal_ex(decryption_context, plain_text + plain_text_length, &final_length)
++          != 1)
++  {
++    free(plain_text);
++    return NULL;
++  }
+ 
+-hashkit_string_st *destination = hashkit_string_create(plain_text_length + final_length);
+-if (destination == NULL) {
+-  return NULL;
+-}
+-char *dest = hashkit_string_c_str_mutable(destination);
+-memcpy(dest, plain_text, plain_text_length + final_length);
+-hashkit_string_set_length(destination, plain_text_length + final_length);
+-return destination;
++  hashkit_string_st *destination = hashkit_string_create(plain_text_length + final_length);
++  if (destination == NULL) {
++    return NULL;
++  }
++  char *dest = hashkit_string_c_str_mutable(destination);
++  memcpy(dest, plain_text, plain_text_length + final_length);
++  hashkit_string_set_length(destination, plain_text_length + final_length);
++  return destination;
+ }
+ 
+ encryption_context_t *aes_clone_cryptographic_context(encryption_context_t *source) {
+-- 
+2.31.1
+
+From 72df8af3b9cc00f590afa31371be571c1169a268 Mon Sep 17 00:00:00 2001
+From: Michael Wallner <mike@php.net>
+Date: Mon, 12 Jul 2021 15:59:57 +0200
+Subject: [PATCH 6/7] libhashkit/aes: simplify code
+
+---
+ src/libhashkit/aes.cc     | 125 ++++++++++++++++++++++++--------------
+ src/libhashkit/aes.h      |  26 +-------
+ src/libhashkit/encrypt.cc |  31 +---------
+ src/libhashkit/hashkit.cc |  37 +----------
+ 4 files changed, 87 insertions(+), 132 deletions(-)
+
+diff --git a/src/libhashkit/aes.cc b/src/libhashkit/aes.cc
+index 156bcd3d..86a41dd7 100644
+--- a/src/libhashkit/aes.cc
++++ b/src/libhashkit/aes.cc
+@@ -26,45 +26,60 @@
+ #define AES_KEY_NBYTES 32
+ #define AES_IV_NBYTES  32
+ 
+-bool aes_initialize(const unsigned char *key, const size_t key_length,
+-                    encryption_context_t *crypto_context) {
++struct aes_key_t {
++  EVP_CIPHER_CTX *encryption_context;
++  EVP_CIPHER_CTX *decryption_context;
++};
++
++
++aes_key_t *aes_create_key(const char *key, const size_t key_length) {
+   unsigned char aes_key[AES_KEY_NBYTES];
+   unsigned char aes_iv[AES_IV_NBYTES];
++  const unsigned char *ukey = (const unsigned char *) key;
++
+   if (!key) {
+-    return false;
++    return NULL;
+   }
+ 
+-  int i = EVP_BytesToKey(EVP_aes_256_cbc(), EVP_sha256(), NULL, key, key_length, DIGEST_ROUNDS,
++  int i = EVP_BytesToKey(EVP_aes_256_cbc(), EVP_sha256(), NULL, ukey, key_length, DIGEST_ROUNDS,
+                          aes_key, aes_iv);
+   if (i != AES_KEY_NBYTES) {
+-    return false;
++    return NULL;
+   }
+ 
+-  EVP_CIPHER_CTX_init(crypto_context->encryption_context);
+-  EVP_CIPHER_CTX_init(crypto_context->decryption_context);
+-  if (EVP_EncryptInit_ex(crypto_context->encryption_context, EVP_aes_256_cbc(), NULL, key, aes_iv)
+-          != 1
+-      || EVP_DecryptInit_ex(crypto_context->decryption_context, EVP_aes_256_cbc(), NULL, key,
+-                            aes_iv)
+-          != 1)
++  aes_key_t *aes_ctx = (aes_key_t *) malloc(sizeof(aes_key_t));
++
++  if (!(aes_ctx->encryption_context = EVP_CIPHER_CTX_new())) {
++    return NULL;
++  }
++  if (!(aes_ctx->decryption_context = EVP_CIPHER_CTX_new())) {
++    EVP_CIPHER_CTX_free(aes_ctx->encryption_context);
++    return NULL;
++  }
++
++  EVP_CIPHER_CTX_init(aes_ctx->encryption_context);
++  EVP_CIPHER_CTX_init(aes_ctx->decryption_context);
++  if (EVP_EncryptInit_ex(aes_ctx->encryption_context, EVP_aes_256_cbc(), NULL, ukey, aes_iv) != 1
++      || EVP_DecryptInit_ex(aes_ctx->decryption_context, EVP_aes_256_cbc(), NULL, ukey, aes_iv) != 1)
+   {
+-    return false;
++    aes_free_key(aes_ctx);
++    return NULL;
+   }
+-  return true;
++
++  return aes_ctx;
+ }
+ 
+-hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsigned char *source,
+-                               size_t source_length) {
+-  EVP_CIPHER_CTX *encryption_context = crypto_context->encryption_context;
++hashkit_string_st *aes_encrypt(aes_key_t *ctx, const char *source, size_t source_length) {
++  EVP_CIPHER_CTX *encryption_context = ctx->encryption_context;
+   int cipher_length = source_length + EVP_CIPHER_CTX_block_size(encryption_context);
+   int final_length = 0;
++  const unsigned char *usource = (const unsigned char *) source;
+   unsigned char *cipher_text = (unsigned char *) malloc(cipher_length);
+-  if (cipher_text == NULL) {
++  if (!cipher_text) {
+     return NULL;
+   }
+   if (EVP_EncryptInit_ex(encryption_context, NULL, NULL, NULL, NULL) != 1
+-      || EVP_EncryptUpdate(encryption_context, cipher_text, &cipher_length, source, source_length)
+-          != 1
++      || EVP_EncryptUpdate(encryption_context, cipher_text, &cipher_length, usource, source_length) != 1
+       || EVP_EncryptFinal_ex(encryption_context, cipher_text + cipher_length, &final_length) != 1)
+   {
+     free(cipher_text);
+@@ -72,7 +87,7 @@ hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsig
+   }
+ 
+   hashkit_string_st *destination = hashkit_string_create(cipher_length + final_length);
+-  if (destination == NULL) {
++  if (!destination) {
+     return NULL;
+   }
+   char *dest = hashkit_string_c_str_mutable(destination);
+@@ -81,28 +96,25 @@ hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsig
+   return destination;
+ }
+ 
+-hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsigned char *source,
+-                               size_t source_length) {
+-  EVP_CIPHER_CTX *decryption_context = crypto_context->decryption_context;
++hashkit_string_st *aes_decrypt(aes_key_t *ctx, const char *source, size_t source_length) {
++  EVP_CIPHER_CTX *decryption_context = ctx->decryption_context;
+   int plain_text_length = source_length;
+   int final_length = 0;
++  const unsigned char *usource = (const unsigned char *) source;
+   unsigned char *plain_text = (unsigned char *) malloc(plain_text_length);
+-  if (plain_text == NULL) {
++  if (!plain_text) {
+     return NULL;
+   }
+   if (EVP_DecryptInit_ex(decryption_context, NULL, NULL, NULL, NULL) != 1
+-      || EVP_DecryptUpdate(decryption_context, plain_text, &plain_text_length, source,
+-                           source_length)
+-          != 1
+-      || EVP_DecryptFinal_ex(decryption_context, plain_text + plain_text_length, &final_length)
+-          != 1)
++      || EVP_DecryptUpdate(decryption_context, plain_text, &plain_text_length, usource, source_length) != 1
++      || EVP_DecryptFinal_ex(decryption_context, plain_text + plain_text_length, &final_length) != 1)
+   {
+     free(plain_text);
+     return NULL;
+   }
+ 
+   hashkit_string_st *destination = hashkit_string_create(plain_text_length + final_length);
+-  if (destination == NULL) {
++  if (!destination) {
+     return NULL;
+   }
+   char *dest = hashkit_string_c_str_mutable(destination);
+@@ -111,22 +123,40 @@ hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsig
+   return destination;
+ }
+ 
+-encryption_context_t *aes_clone_cryptographic_context(encryption_context_t *source) {
+-  encryption_context_t *new_context = (encryption_context_t *) malloc(sizeof(encryption_context_t));
+-  if (new_context == NULL)
++aes_key_t *aes_clone_key(aes_key_t *old_context) {
++  if (!old_context) {
+     return NULL;
++  }
+ 
+-  new_context->encryption_context = EVP_CIPHER_CTX_new();
+-  new_context->decryption_context = EVP_CIPHER_CTX_new();
+-  if (new_context->encryption_context == NULL || new_context->decryption_context == NULL) {
+-    free(new_context);
+-    return NULL;
++  aes_key_t *new_context = (aes_key_t *) malloc(sizeof(aes_key_t));
++  if (new_context) {
++    new_context->encryption_context = EVP_CIPHER_CTX_new();
++    new_context->decryption_context = EVP_CIPHER_CTX_new();
++    if (!new_context->encryption_context || !new_context->decryption_context) {
++      aes_free_key(new_context);
++      return NULL;
++    }
++    EVP_CIPHER_CTX_copy(new_context->encryption_context, old_context->encryption_context);
++    EVP_CIPHER_CTX_copy(new_context->decryption_context, old_context->decryption_context);
+   }
+-  EVP_CIPHER_CTX_copy(new_context->encryption_context, source->encryption_context);
+-  EVP_CIPHER_CTX_copy(new_context->decryption_context, source->decryption_context);
++
+   return new_context;
+ }
+ 
++void aes_free_key(aes_key_t *context) {
++  if (context) {
++    if (context->encryption_context) {
++      EVP_CIPHER_CTX_free(context->encryption_context);
++      context->encryption_context = NULL;
++    }
++    if (context->decryption_context) {
++      EVP_CIPHER_CTX_free(context->decryption_context);
++      context->decryption_context = NULL;
++    }
++    free(context);
++  }
++}
++
+ #else
+ 
+ #  include "libhashkit/rijndael.hpp"
+@@ -172,7 +202,7 @@ aes_key_t *aes_create_key(const char *key, const size_t key_length) {
+ }
+ 
+ aes_key_t *aes_clone_key(aes_key_t *_aes_key) {
+-  if (_aes_key == NULL) {
++  if (!_aes_key) {
+     return NULL;
+   }
+ 
+@@ -185,7 +215,7 @@ aes_key_t *aes_clone_key(aes_key_t *_aes_key) {
+ }
+ 
+ hashkit_string_st *aes_encrypt(aes_key_t *_aes_key, const char *source, size_t source_length) {
+-  if (_aes_key == NULL) {
++  if (!_aes_key) {
+     return NULL;
+   }
+ 
+@@ -214,7 +244,7 @@ hashkit_string_st *aes_encrypt(aes_key_t *_aes_key, const char *source, size_t s
+ }
+ 
+ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t source_length) {
+-  if (_aes_key == NULL) {
++  if (!_aes_key) {
+     return NULL;
+   }
+ 
+@@ -252,4 +282,11 @@ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t s
+ 
+   return destination;
+ }
++
++void aes_free_key(aes_key_t *key) {
++  if (key) {
++    free(key);
++  }
++}
++
+ #endif
+diff --git a/src/libhashkit/aes.h b/src/libhashkit/aes.h
+index 243d501f..4d3e6d7f 100644
+--- a/src/libhashkit/aes.h
++++ b/src/libhashkit/aes.h
+@@ -15,34 +15,14 @@
+ 
+ #pragma once
+ 
+-#ifdef HAVE_OPENSSL_CRYPTO
+-
+-#include <openssl/evp.h>
+-
+-typedef struct encryption_context {
+-  EVP_CIPHER_CTX *encryption_context;
+-  EVP_CIPHER_CTX *decryption_context;
+-} encryption_context_t;
+-
+-hashkit_string_st *aes_encrypt(encryption_context_t *crypto_context, const unsigned char *source,
+-                               size_t source_length);
+-
+-hashkit_string_st *aes_decrypt(encryption_context_t *crypto_context, const unsigned char *source,
+-                               size_t source_length);
+-
+-bool aes_initialize(const unsigned char *key, const size_t key_length,
+-                    encryption_context_t *crypto_context);
+-
+-encryption_context_t *aes_clone_cryptographic_context(encryption_context_t *source);
+-#else
+-
+ struct aes_key_t;
+ 
+ hashkit_string_st *aes_encrypt(aes_key_t *_aes_key, const char *source, size_t source_length);
+ 
+ hashkit_string_st *aes_decrypt(aes_key_t *_aes_key, const char *source, size_t source_length);
+ 
+-aes_key_t *aes_create_key(const char *key, const size_t key_length);
++aes_key_t *aes_create_key(const char *key, size_t key_length);
+ 
+ aes_key_t *aes_clone_key(aes_key_t *_aes_key);
+-#endif
++
++void aes_free_key(aes_key_t *_aes_key);
+diff --git a/src/libhashkit/encrypt.cc b/src/libhashkit/encrypt.cc
+index effa299f..ff269c05 100644
+--- a/src/libhashkit/encrypt.cc
++++ b/src/libhashkit/encrypt.cc
+@@ -15,50 +15,21 @@
+ 
+ #include "libhashkit/common.h"
+ 
+-#ifdef HAVE_OPENSSL_CRYPTO
+-#  include <openssl/evp.h>
+-#endif
+-
+ hashkit_string_st *hashkit_encrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-#ifdef HAVE_OPENSSL_CRYPTO
+-  return aes_encrypt((encryption_context_t *) kit->_key,
+-                     (const unsigned char *) source, source_length);
+-#else
+   return aes_encrypt((aes_key_t *) kit->_key, source,
+                      source_length);
+-#endif
+ }
+ 
+ hashkit_string_st *hashkit_decrypt(hashkit_st *kit, const char *source, size_t source_length) {
+-#ifdef HAVE_OPENSSL_CRYPTO
+-  return aes_decrypt((encryption_context_t *) kit->_key,
+-                     (const unsigned char *) source, source_length);
+-#else
+   return aes_decrypt((aes_key_t *)kit->_key, source, source_length);
+-#endif
+ }
+ 
+-#ifdef HAVE_OPENSSL_CRYPTO
+-bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+-  kit->_key = (encryption_context_t *) malloc(sizeof(encryption_context_t));
+-  ((encryption_context_t *) kit->_key)->encryption_context = EVP_CIPHER_CTX_new();
+-  ((encryption_context_t *) kit->_key)->decryption_context = EVP_CIPHER_CTX_new();
+-  if (((encryption_context_t *) kit->_key)->encryption_context == NULL
+-      || ((encryption_context_t *) kit->_key)->decryption_context == NULL)
+-  {
+-    return false;
+-  }
+-  return aes_initialize((const unsigned char *) key, key_length,
+-                        (encryption_context_t *) kit->_key);
+-}
+-#else
+ bool hashkit_key(hashkit_st *kit, const char *key, const size_t key_length) {
+   if (kit->_key) {
+-    free(kit->_key);
++    aes_free_key((aes_key_t *) kit->_key);
+   }
+ 
+   kit->_key = aes_create_key(key, key_length);
+ 
+   return bool(kit->_key);
+ }
+-#endif
+diff --git a/src/libhashkit/hashkit.cc b/src/libhashkit/hashkit.cc
+index e61b014d..63b7f62e 100644
+--- a/src/libhashkit/hashkit.cc
++++ b/src/libhashkit/hashkit.cc
+@@ -15,10 +15,6 @@
+ 
+ #include "libhashkit/common.h"
+ 
+-#ifdef HAVE_OPENSSL_CRYPTO
+-#  include <openssl/evp.h>
+-#endif
+-
+ static inline void _hashkit_init(hashkit_st *self) {
+   self->base_hash.function = hashkit_one_at_a_time;
+   self->base_hash.context = NULL;
+@@ -56,26 +52,11 @@ hashkit_st *hashkit_create(hashkit_st *self) {
+   return self;
+ }
+ 
+-#ifdef HAVE_OPENSSL_CRYPTO
+-static void cryptographic_context_free(encryption_context_t *context) {
+-  EVP_CIPHER_CTX_free(context->encryption_context);
+-  EVP_CIPHER_CTX_free(context->decryption_context);
+-  free(context);
+-}
+-#endif
+-
+ void hashkit_free(hashkit_st *self) {
+-#ifdef HAVE_OPENSSL_CRYPTO
+   if (self and self->_key) {
+-    cryptographic_context_free((encryption_context_t *)self->_key);
++    aes_free_key((aes_key_t *) self->_key);
+     self->_key = NULL;
+   }
+-#else
+-  if (self and self->_key) {
+-    free(self->_key);
+-    self->_key = NULL;
+-  }
+-#endif
+ 
+   if (hashkit_is_allocated(self)) {
+     free(self);
+@@ -98,21 +79,7 @@ hashkit_st *hashkit_clone(hashkit_st *destination, const hashkit_st *source) {
+   destination->base_hash = source->base_hash;
+   destination->distribution_hash = source->distribution_hash;
+   destination->flags = source->flags;
+-#ifdef HAVE_OPENSSL_CRYPTO
+-  if (destination->_key) {
+-    cryptographic_context_free((encryption_context_t *)destination->_key);
+-    destination->_key = NULL;
+-  }
+-  if (source->_key) {
+-    destination->_key =
+-        aes_clone_cryptographic_context(((encryption_context_t *) source->_key));
+-    if (destination->_key) {
+-      
+-    }
+-  }
+-#else
+-  destination->_key = aes_clone_key(static_cast<aes_key_t *>(source->_key));
+-#endif
++  destination->_key = aes_clone_key((aes_key_t *) source->_key);
+ 
+   return destination;
+ }
+-- 
+2.31.1
+
