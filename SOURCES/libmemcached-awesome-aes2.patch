@@ -1,0 +1,24 @@
+diff --git a/src/libhashkit/CMakeLists.txt b/src/libhashkit/CMakeLists.txt
+index b820d27b..fb732fcf 100644
+--- a/src/libhashkit/CMakeLists.txt
++++ b/src/libhashkit/CMakeLists.txt
+@@ -17,7 +17,6 @@ set(libhashkit_sources
+         murmur3.cc
+         murmur3_api.cc
+         one_at_a_time.cc
+-        rijndael.cc
+         str_algorithm.cc
+         strerror.cc
+         string.cc
+@@ -53,6 +52,10 @@ if(ENABLE_OPENSSL_CRYPTO)
+         endif()
+ endif()
+ 
++if (NOT OPENSSL_CRYPTO_LIBRARY)
++        set (libhashkit_sources ${libhashkit_sources} rijndael.cc)
++endif()
++
+ configure_file(hashkitcon.h.in hashkitcon.h @ONLY)
+ 
+ install(TARGETS libhashkit EXPORT libhashkit-targets
+

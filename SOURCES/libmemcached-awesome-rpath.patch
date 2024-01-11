@@ -1,0 +1,21 @@
+commit 6651fe2eaded59f1657c21a2ea3880807f8c7bb1
+Author: Tomas Korbar <tkorbar@redhat.com>
+Date:   Fri Nov 12 15:53:25 2021 +0100
+
+    Fix rpath
+
+diff --git a/CMakeConfig.txt b/CMakeConfig.txt
+index d8afcae..d2acf8f 100644
+--- a/CMakeConfig.txt
++++ b/CMakeConfig.txt
+@@ -11,10 +11,6 @@ set(CMAKE_INSTALL_PREFIX /usr/local
+ if(APPLE)
+     set(CMAKE_INSTALL_RPATH @loader_path
+         CACHE STRING "set relative rpath")
+-elseif(UNIX)
+-    # FIXME
+-    set(CMAKE_INSTALL_RPATH "\$ORIGIN"
+-        CACHE STRING "set relative rpath")
+ endif()
+ 
+ if(${CMAKE_VERSION} VERSION_LESS "3.12")
